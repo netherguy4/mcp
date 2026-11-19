@@ -176,33 +176,7 @@ impl McpClient {
     /// we fall back to the handshake and end up exactly where we are today.
     async fn negotiate(&mut self, reopen: &TransportFactory<'_>) -> Result<()> {
         let version = match self.discover().await {
-            Probe::Discovered(discovered) => {
-                let best = discovered
-                    .best_common_version()
-                    .with_context(|| {
-                        format!(
-                            "no common MCP protocol version with server '{}': \
-                             it offers [{}], we speak [{}]",
-                            // Identity is optional and self-reported; the spec
-                            // says never to make behavior depend on it, so it
-                            // only ever decorates a message.
-                            discovered
-                                .server_info()
-                                .map(|i| i.name)
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            discovered.supported_versions.join(", "),
-                            SUPPORTED_PROTOCOL_VERSIONS.join(", "),
-                        )
-                    })?
-                    .to_string();
-
-                // Stateless revisions have no handshake to run at all.
-                if is_stateless_version(&best) {
-                    best
-                } else {
-                    self.handshake(&best).await?
-                }
-            }
+            Probe::Discovered(discovered) => self.adopt(&discovered).await?,
             Probe::Unsupported(e) => {
                 tracing::debug!(
                     error = %e,
@@ -215,7 +189,16 @@ impl McpClient {
                     peer = %self.peer,
                     "server/discover went unanswered — falling back to the initialize handshake"
                 );
-                self.handshake(PROTOCOL_VERSION_LEGACY).await?
+                match self.handshake(PROTOCOL_VERSION_LEGACY).await {
+                    Ok(version) => version,
+                    // A stateless peer that was merely slow to start answers
+                    // the abandoned probe late and then refuses `initialize`
+                    // (-32022). It is warm now, so one more probe settles it.
+                    Err(handshake_error) => match self.discover().await {
+                        Probe::Discovered(discovered) => self.adopt(&discovered).await?,
+                        _ => return Err(handshake_error),
+                    },
+                }
             }
             Probe::Died(probe_error) => {
                 // The fallback cannot run on the transport the probe just
@@ -248,6 +231,35 @@ impl McpClient {
         self.transport.set_protocol_version(&version);
         self.protocol_version = version;
         Ok(())
+    }
+
+    /// The revision to speak with a peer that answered `server/discover`.
+    async fn adopt(&self, discovered: &ServerDiscoverResult) -> Result<String> {
+        let best = discovered
+            .best_common_version()
+            .with_context(|| {
+                format!(
+                    "no common MCP protocol version with server '{}': \
+                     it offers [{}], we speak [{}]",
+                    // Identity is optional and self-reported; the spec
+                    // says never to make behavior depend on it, so it
+                    // only ever decorates a message.
+                    discovered
+                        .server_info()
+                        .map(|i| i.name)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    discovered.supported_versions.join(", "),
+                    SUPPORTED_PROTOCOL_VERSIONS.join(", "),
+                )
+            })?
+            .to_string();
+
+        // Stateless revisions have no handshake to run at all.
+        if is_stateless_version(&best) {
+            Ok(best)
+        } else {
+            self.handshake(&best).await
+        }
     }
 
     /// The 2026-07-28 discovery probe.
@@ -1914,6 +1926,60 @@ mod tests {
             started.elapsed()
         );
         assert_eq!(inner.notified(), vec!["notifications/initialized"]);
+    }
+
+    /// A stateless-only peer that starts slower than the probe budget answers
+    /// the abandoned probe late, then refuses `initialize` with -32022. The
+    /// client must probe again instead of failing the connection.
+    #[tokio::test]
+    async fn a_slow_stateless_peer_is_probed_again_after_refusing_initialize() {
+        /// Hangs on the first `server/discover` only, like a cold start.
+        struct SlowStart(Arc<MockTransport>, std::sync::atomic::AtomicBool);
+
+        #[async_trait::async_trait]
+        impl Transport for SlowStart {
+            async fn request(&self, msg: &JsonRpcRequest) -> Result<JsonRpcResponse> {
+                if msg.method == "server/discover" && !self.1.swap(true, Ordering::SeqCst) {
+                    std::future::pending::<()>().await;
+                }
+                self.0.request(msg).await
+            }
+            async fn notify(&self, msg: &JsonRpcNotification) -> Result<()> {
+                self.0.notify(msg).await
+            }
+            async fn close(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let inner = MockTransport::new(vec![
+            (
+                "server/discover",
+                discover_ok(&[PROTOCOL_VERSION_STATELESS]),
+            ),
+            (
+                "initialize",
+                Reply::Error(
+                    error_codes::UNSUPPORTED_PROTOCOL_VERSION,
+                    "connection is serving the 2026-07-28 protocol",
+                ),
+            ),
+        ]);
+        let transport: Arc<dyn Transport> = Arc::new(SlowStart(
+            Arc::clone(&inner),
+            std::sync::atomic::AtomicBool::new(false),
+        ));
+        let mut client = McpClient::new(Arc::clone(&transport), "slow".to_string());
+
+        client
+            .negotiate(&|| Ok(Arc::clone(&transport)))
+            .await
+            .unwrap();
+
+        assert_eq!(client.protocol_version(), PROTOCOL_VERSION_STATELESS);
+        // The hung first probe never reached `inner`, so it recorded only these.
+        assert_eq!(inner.methods_sent(), vec!["initialize", "server/discover"]);
+        assert!(inner.notified().is_empty());
     }
 
     /// A backend that dies on the unknown method must not take the connection
